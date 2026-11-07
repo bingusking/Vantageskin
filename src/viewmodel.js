@@ -11,6 +11,7 @@ import { radialTexture } from './textures.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { assets } from './assets.js';
+import { KNIFE_ANIM, FOLD_PIVOT } from './knifeinspect.js';
 
 const POSE = {
   rifle: new THREE.Vector3(0.1, -0.105, -0.2),
@@ -148,10 +149,7 @@ const INSPECT = {
     [3.3, 0, 0, 0, 0, 0, 0],
   ],
 };
-// forward-grip knives flip half a turn in the fingers to show the other face, then back
-const twirlAt = (T) => T < 1.2 ? 0 : T < 1.65 ? Math.PI * ease((T - 1.2) / 0.45) : T < 2.6 ? Math.PI : T < 3.05 ? Math.PI * (1 + ease((T - 2.6) / 0.45)) : 0;
 const DEF_GRIP = new THREE.Vector3(0, -0.04, 0.03);
-const AXIS_Z = new THREE.Vector3(0, 0, 1);
 
 function sampleKeys(keys, t) {
   if (t >= keys[keys.length - 1][0]) return keys[keys.length - 1].slice(1);
@@ -385,6 +383,7 @@ export class ViewModel {
   // id: weapon id; item: equipped inventory item for this weapon (or null).
   setWeapon(id, type, deployTime = 0.5, item = null) {
     if (this.gun) this.holder.remove(this.gun);
+    if (this.rootL) { this.scene.remove(this.rootL); this.rootL = null; this.gunL = null; }
     this.id = id; this.type = type;
     if (this.skinned) this.useArms(['melee', 'grenade', 'bomb'].includes(type) ? this.fistArms : (this.gunArms || this.fistArms));
     this.def = WEAPONS[id];
@@ -418,8 +417,22 @@ export class ViewModel {
     this.pump = part('pump'); this.pumpBase = this.pump ? this.pump.position.x : 0;
     this.cyl = part('cylinder'); this.cylTurn = 0; this.cylTarget = 0;
     this.bfA = part('bfA'); this.bfB = part('bfB');
-    this.kPivot = part('karambitPivot');
-    this.twirlA = 0;
+    this.knifeAnim = type === 'melee' ? KNIFE_ANIM[knifeType] || KNIFE_ANIM.standard : null;
+    // folding blades turn about their pivot pin during the inspect
+    this.kBlade = FOLD_PIVOT[knifeType] ? part('blade') : null;
+    this.knifeDirty = false;
+    // push daggers come in pairs: a second one in the left fist, mirroring the right
+    if (id === 'knife' && knifeType === 'push') {
+      this.rootL = new THREE.Group();
+      this.holderL = new THREE.Group(); this.holderL.scale.setScalar(this.holder.scale.x);
+      this.rootL.add(this.holderL);
+      this.gunL = buildGun(modelId);
+      if (item?.defId) applySkinAsync(this.gunL, item, { size: 1024 });
+      this.gunL.traverse(o => { if (o.isMesh) o.castShadow = false; });
+      this.holderL.add(this.gunL);
+      this.scene.add(this.rootL);
+    }
+    this.swingSide = 1;
     this.deployT = 0; this.deployDur = Math.max(0.2, deployTime);
     this.inspectT = -1; this.reloadT = -1; this.cycleT = -1; this.throwT = -1; this.windT = -1;
     this.gun.visible = true;
@@ -434,7 +447,7 @@ export class ViewModel {
     this.flash.scale.setScalar(0.2 + Math.random() * 0.15);
     this.flashTime = 0.04;
     this.inspectT = -1;
-    if (this.type === 'melee') { this.swing = 1; this.swingDir *= -1; }
+    if (this.type === 'melee') { this.swing = 1; this.swingDir *= -1; if (this.gunL) this.swingSide = -this.swingSide; }
     if (this.def?.bolt || this.def?.pump) this.cycleT = 0;
     if (this.cyl) this.cylTarget += Math.PI / 3;
   }
@@ -507,11 +520,18 @@ export class ViewModel {
     }
 
     // knife swing
+    let swingL = null;
     if (this.swing > 0) {
       this.swing = Math.max(0, this.swing - dt * 3.2);
       const s = Math.sin((1 - this.swing) * Math.PI);
-      rot.y += s * 0.9 * this.swingDir; rot.z += s * 0.6 * this.swingDir;
-      pos.x -= s * 0.08 * this.swingDir; pos.z -= s * 0.1;
+      if (this.gunL) {
+        // push daggers: a straight jab, alternating fists
+        const j = { z: -s * 0.13, y: s * 0.015, rx: -s * 0.15 };
+        if (this.swingSide > 0) { pos.z += j.z; pos.y += j.y; rot.x += j.rx; } else swingL = j;
+      } else {
+        rot.y += s * 0.9 * this.swingDir; rot.z += s * 0.6 * this.swingDir;
+        pos.x -= s * 0.08 * this.swingDir; pos.z -= s * 0.1;
+      }
     }
 
     // grenade: wind up (pin pulled, arm back) and throw
@@ -554,31 +574,38 @@ export class ViewModel {
     }
 
     // inspect
-    let twirl = 0, dropL = 0;
+    let dropL = 0, ks = null;
     const iq = (this._iq ||= new THREE.Quaternion()).identity();
     if (this.inspectT >= 0) {
-      const melee = this.type === 'melee', style = melee ? KNIFE_STYLE[this.knifeType] || 'forward' : null;
-      const keys = melee ? INSPECT[style] : INSPECT.default;
+      const melee = this.type === 'melee' && this.knifeHold && this.knifeAnim;
       this.inspectT += dt;
-      const k = sampleKeys(keys, this.inspectT);
-      if (melee && this.knifeHold) {
-        const h = this.knifeHold, across = new THREE.Vector3().crossVectors(h.k, h.palm).normalize();
-        iq.setFromAxisAngle(h.k, k[0]).multiply(new THREE.Quaternion().setFromAxisAngle(across, k[1]));
-      } else { rot.x += k[0]; rot.y += k[1]; rot.z += k[2]; }
-      pos.x += k[3] * 0.6; pos.y += k[4] * 0.6; pos.z += k[5] * 0.6;
-      const T = this.inspectT, end = keys[keys.length - 1][0];
-      if (this.bfA) {
-        const open = T < 2.8 ? Math.abs(Math.sin(T * Math.PI * 1.2)) : 0;
-        this.bfA.rotation.z = open * Math.PI;
-        this.bfB.rotation.z = -open * Math.PI;
+      const T = this.inspectT;
+      if (melee) {
+        // knives: each type has its own animation (knifeinspect.js). The hand
+        // turns about its own axes through the grip and the arm follows it.
+        const A = this.knifeAnim;
+        if (T > A.dur) this.inspectT = -1;
+        else {
+          ks = A.f(T);
+          const h = this.knifeHold;
+          const kk = h.k.clone().normalize(), palm = h.palm.clone().normalize();
+          const across = new THREE.Vector3().crossVectors(kk, palm).normalize();
+          iq.setFromAxisAngle(kk, ks.roll || 0)
+            .multiply(new THREE.Quaternion().setFromAxisAngle(across, ks.flex || 0))
+            .multiply(new THREE.Quaternion().setFromAxisAngle(palm, ks.dev || 0));
+          pos.x += ks.x || 0; pos.y += ks.y || 0; pos.z += ks.z || 0;
+        }
+      } else {
+        const keys = INSPECT.default;
+        const k = sampleKeys(keys, T);
+        rot.x += k[0]; rot.y += k[1]; rot.z += k[2];
+        pos.x += k[3] * 0.6; pos.y += k[4] * 0.6; pos.z += k[5] * 0.6;
+        const end = keys[keys.length - 1][0];
+        // pistols: the support hand lets go while the gun is turned over
+        if (this.type === 'pistol') dropL = ease(Math.max(0, Math.min(1, T / 0.35, (end - T) / 0.45)));
+        if (T > end) { this.inspectT = -1; dropL = 0; }
       }
-      if (this.kPivot) this.kPivot.rotation.z = T > 0.4 && T < 1.6 ? ease((T - 0.4) / 1.2) * Math.PI * 4 : 0;
-      else if (melee && !this.bfA && style === 'forward') twirl = twirlAt(T);
-      // pistols: the support hand lets go while the gun is turned over
-      if (this.type === 'pistol') dropL = ease(Math.max(0, Math.min(1, T / 0.35, (end - T) / 0.45)));
-      if (T > end) { this.inspectT = -1; twirl = 0; dropL = 0; iq.identity(); if (this.bfA) { this.bfA.rotation.z = 0; this.bfB.rotation.z = 0; } }
     }
-    this.setTwirl(twirl);
 
     this.root.position.copy(pos);
     this.root.quaternion.setFromEuler(rot).multiply(this.baseQ || new THREE.Quaternion());
@@ -589,25 +616,71 @@ export class ViewModel {
       this.root.quaternion.multiply(iq);
       this.root.position.add(before.sub(g.applyQuaternion(this.root.quaternion)));
     }
+    this.poseKnife(ks);
+    if (this.rootL) {
+      // the left push dagger: the right one mirrored across the middle of the view
+      const q = this.root.quaternion;
+      this.rootL.position.set(-this.root.position.x, this.root.position.y, this.root.position.z);
+      this.rootL.quaternion.set(q.x, -q.y, -q.z, q.w);
+      if (swingL) {
+        this.rootL.position.z += swingL.z; this.rootL.position.y += swingL.y;
+        this.rootL.quaternion.premultiply(new THREE.Quaternion().setFromAxisAngle(V3(1, 0, 0), swingL.rx));
+      }
+    }
     this.solveArms(handR, magReach, dropL);
   }
 
-  // Spin the knife in the fingers, about its own length through the grip.
-  // The hands follow the holder, not the knife, so they stay still.
-  setTwirl(a) {
-    if (a === (this.twirlA || 0)) return;
-    this.twirlA = a;
-    const g = this.gun.userData.grip || DEF_GRIP;
-    this.gun.quaternion.setFromAxisAngle(AXIS_Z, a);
-    this.gun.position.copy(g).sub(g.clone().applyQuaternion(this.gun.quaternion));
+  // The knife inside the hand during an inspect: spins about pivots (the
+  // fingers, a ring, a lanyard), tosses, folding blades and balisong handles.
+  // The hands follow the holder, not the knife, so a knife spinning in the
+  // fingers doesn't drag the hand round with it.
+  poseKnife(ks) {
+    const g = this.gun;
+    const parts = [g, ...(this.gunL ? [this.gunL] : [])];
+    if (!ks) {
+      if (!this.knifeDirty) return;
+      this.knifeDirty = false;
+      for (const k of parts) { k.position.set(0, 0, 0); k.quaternion.identity(); }
+      if (this.kBlade) { this.kBlade.position.set(0, 0, 0); this.kBlade.rotation.set(0, 0, 0); }
+      if (this.bfA) { this.bfA.rotation.z = 0; this.bfB.rotation.z = 0; }
+      for (const k of this.gunL ? [this.gunL] : []) { const b = k.getObjectByName('blade'); if (b) b.rotation.set(0, 0, 0); }
+      return;
+    }
+    this.knifeDirty = true;
+    const m = (this._km ||= new THREE.Matrix4()).identity();
+    const t = (this._kt ||= new THREE.Matrix4()), r = (this._kr ||= new THREE.Matrix4());
+    for (const [p, axis, ang] of ks.spins || []) {
+      if (!ang) continue;
+      m.premultiply(t.makeTranslation(-p.x, -p.y, -p.z)).premultiply(r.makeRotationAxis(axis, ang)).premultiply(t.makeTranslation(p.x, p.y, p.z));
+    }
+    if (ks.toss) {
+      // the toss is given in view space; turn it into the holder's axes
+      const v = ks.toss.clone().applyQuaternion(this.root.quaternion.clone().invert()).divideScalar(this.holder.scale.x);
+      m.premultiply(t.makeTranslation(v.x, v.y, v.z));
+    }
+    for (const k of parts) m.decompose(k.position, k.quaternion, k.scale);
+    // folding blades turn about their pivot pin (the model's own axes)
+    const pv = FOLD_PIVOT[this.knifeType];
+    if (this.kBlade && pv) {
+      const a = ks.fold || 0, c = Math.cos(a), sn = Math.sin(a);
+      this.kBlade.rotation.set(0, 0, a);
+      this.kBlade.position.set(pv[0] - (c * pv[0] - sn * pv[1]), pv[1] - (sn * pv[0] + c * pv[1]), 0);
+    }
+    // balisong: the held handle stays in the hand while the blade swings round
+    if (this.bfA && ks.bf) {
+      this.bfA.rotation.z = -ks.bf.blade;
+      this.bfB.rotation.z = -ks.bf.blade + ks.bf.handleB;
+    }
   }
 
   // Hands go where the weapon is this frame; shoulders stay fixed to the camera.
   solveArms(handROverride, magReach, dropL = 0) {
     this.root.updateMatrixWorld(true);
+    this.rootL?.updateMatrixWorld(true);
     const ud = this.gun.userData;
     const local = (v) => this.armSpace.worldToLocal(v);
-    const world = (p) => this.gun.localToWorld(p.clone());
+    // knives: hands hold the holder, so a knife spinning or tossed in the fingers leaves them where they are
+    const world = (p) => (this.type === 'melee' ? this.holder : this.gun).localToWorld(p.clone());
     const grip = ud.grip || new THREE.Vector3(0, -0.04, 0.03);
     const t = this.type;
     let SR = new THREE.Vector3(0.36, -0.62, 0.52), SL = new THREE.Vector3(-0.52, -0.66, 0.38);
@@ -642,6 +715,15 @@ export class ViewModel {
     // the support hand drops out of view (pistol inspect)
     if (L && dropL > 0) L.lerp(L.clone().add(new THREE.Vector3(-0.06, -0.42, 0.12)), dropL);
     if (L && dropL > 0.97) L = null;
+    if (this.gunL && this.skinned && this.knifeHold) {
+      // push daggers: the left fist mirrors the right on its own dagger
+      const SLm = new THREE.Vector3(-SR.x, SR.y, SR.z);
+      const qL = this.armSpace.getWorldQuaternion(new THREE.Quaternion()).invert().multiply(this.holderL.getWorldQuaternion(new THREE.Quaternion()));
+      const LL = local(this.holderL.localToWorld(grip.clone()));
+      this.armL.visible = true;
+      this.armL.solve(SLm, LL, new THREE.Vector3(-0.7, -1, 0.25), this.knifeHold.k.clone().applyQuaternion(qL), this.knifeHold.palm.clone().applyQuaternion(qL));
+      return;
+    }
     if (this.skinned) {
       this.armL.visible = !!L;
       if (L) {
