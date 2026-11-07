@@ -1,0 +1,11 @@
+# Render Blueprint: a free static site. No server or database is needed:
+# the inventory is saved in each player's browser.
+services:
+  - type: web
+    name: vantage-cases
+    runtime: static
+    buildCommand: npm ci && npm run build
+    staticPublishPath: ./dist
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
